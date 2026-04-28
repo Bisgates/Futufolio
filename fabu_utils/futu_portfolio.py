@@ -6,6 +6,7 @@ Usage:
     python3 futu_portfolio.py MSFT 50
     python3 futu_portfolio.py MSFT close
     python3 futu_portfolio.py MSFT 0
+    python3 futu_portfolio.py MSFT 100 --no-record
     python3 futu_portfolio.py MSFT --percent 100 --dry-run
 
 This script drives the existing FutuNiuniu UI via macOS Accessibility.
@@ -15,11 +16,18 @@ It does not use a trading API and does not place real brokerage orders.
 from __future__ import annotations
 
 import argparse
+import csv
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+# Keep this before PyObjC imports so the final elapsed time includes most
+# command startup and import overhead.
+COMMAND_STARTED_AT = time.perf_counter()
 
 try:
     import ApplicationServices as AX
@@ -33,11 +41,17 @@ PROCESS_NAME = "FutuNiuniu"
 APP_PATH = "/Applications/FutuNiuniu.app"
 APPLESCRIPT_NAME = "FutuNiuniu"
 MANAGER_TITLE = "组合管理"
+RECORD_FILENAME = "alpha_second.csv"
+RECORD_HEADER = ["日期", "时间", "股票名称", "代码", "变化前持仓", "变化后持仓", "成交价", "说明"]
 
 KEY_A = 0
 KEY_V = 9
 KEY_DELETE = 51
 CMD = Quartz.kCGEventFlagMaskCommand
+EVENT_PAUSE = 0.003
+FOCUS_SETTLE = 0.01
+SEARCH_RESULT_SETTLE = 0.24
+ROW_SETTLE = 0.02
 
 
 @dataclass(frozen=True)
@@ -111,16 +125,19 @@ def get_pid() -> int:
     return int(result.stdout.splitlines()[0])
 
 
-def activate_app() -> None:
+def activate_app(app=None) -> None:
+    if app is not None:
+        err = AX.AXUIElementSetAttributeValue(app, AX.kAXFrontmostAttribute, True)
+        if err == 0:
+            return
     run_quiet(["osascript", "-e", f'tell application "{APPLESCRIPT_NAME}" to activate'])
-    time.sleep(0.08)
+    time.sleep(FOCUS_SETTLE)
 
 
 def focus_window(app, window) -> None:
     AX.AXUIElementSetAttributeValue(app, AX.kAXFrontmostAttribute, True)
-    AX.AXUIElementPerformAction(window, AX.kAXRaiseAction)
     AX.AXUIElementSetAttributeValue(window, AX.kAXMainAttribute, True)
-    time.sleep(0.08)
+    time.sleep(FOCUS_SETTLE)
 
 
 def ax_get(element, attribute: str):
@@ -206,7 +223,7 @@ def find_window(app, title: str):
     return None
 
 
-def wait_for(predicate: Callable, timeout: float, interval: float = 0.05):
+def wait_for(predicate: Callable, timeout: float, interval: float = 0.02):
     deadline = time.monotonic() + timeout
     last_value = None
     while time.monotonic() < deadline:
@@ -228,7 +245,7 @@ def mouse_click_xy(x: float, y: float) -> None:
             None, event_type, point, Quartz.kCGMouseButtonLeft
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-        time.sleep(0.012)
+        time.sleep(EVENT_PAUSE)
 
 
 def mouse_click(element) -> None:
@@ -236,6 +253,34 @@ def mouse_click(element) -> None:
     if rect is None:
         raise RuntimeError("Cannot click element without position/size")
     mouse_click_xy(rect.cx, rect.cy)
+
+
+def search_result_checkbox_point(window) -> Optional[tuple[float, float]]:
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    return win_rect.x + 59, win_rect.y + 162
+
+
+def first_position_field_point(window) -> Optional[tuple[float, float]]:
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    return win_rect.x + win_rect.w - 98, win_rect.y + 170
+
+
+def confirm_button_point(window) -> Optional[tuple[float, float]]:
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    return win_rect.x + win_rect.w - 62, win_rect.y + win_rect.h - 32
+
+
+def mouse_click_point(point: Optional[tuple[float, float]]) -> bool:
+    if point is None:
+        return False
+    mouse_click_xy(point[0], point[1])
+    return True
 
 
 def press(element) -> None:
@@ -251,22 +296,33 @@ def keypress(key_code: int, flags: int = 0) -> None:
         if flags:
             Quartz.CGEventSetFlags(event, flags)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-        time.sleep(0.012)
+        time.sleep(EVENT_PAUSE)
 
 
 def set_clipboard(text: str) -> None:
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
 
 
-def replace_text(field, text: str) -> None:
+def set_text_via_ax(field, text: str) -> bool:
+    AX.AXUIElementSetAttributeValue(field, AX.kAXFocusedAttribute, True)
+    err = AX.AXUIElementSetAttributeValue(field, AX.kAXValueAttribute, text)
+    return err == 0
+
+
+def replace_text(field, text: str, settle: float = 0.0) -> None:
+    if set_text_via_ax(field, text):
+        if settle:
+            time.sleep(settle)
+        return
+
     AX.AXUIElementSetAttributeValue(field, AX.kAXFocusedAttribute, True)
     mouse_click(field)
-    time.sleep(0.03)
+    time.sleep(FOCUS_SETTLE)
     set_clipboard(text)
     keypress(KEY_A, CMD)
     keypress(KEY_DELETE)
     keypress(KEY_V, CMD)
-    time.sleep(0.08)
+    time.sleep(FOCUS_SETTLE)
 
 
 def button_text_is(element, label: str) -> bool:
@@ -275,31 +331,34 @@ def button_text_is(element, label: str) -> bool:
     return label in ax_text(element)
 
 
+def find_manager_button(app):
+    for window in windows(app):
+        found = find_descendant(window, lambda e: button_text_is(e, MANAGER_TITLE))
+        if found:
+            return found
+    return None
+
+
 def open_manager(app):
     manager = find_window(app, MANAGER_TITLE)
     if manager:
         focus_window(app, manager)
         return manager
 
-    # Navigate to the portfolio tab first, in case the app is on another page.
-    for window in windows(app):
-        portfolio_button = find_descendant(
-            window,
-            lambda e: button_text_is(e, "组合") and ax_rect(e) and ax_rect(e).x < 140,
-        )
-        if portfolio_button:
-            press(portfolio_button)
-            time.sleep(0.15)
-            break
-
-    def manager_button():
+    button = find_manager_button(app)
+    if not button:
+        # Navigate to the portfolio tab only when the manager button is not
+        # already visible. This is the hot path after the first successful run.
         for window in windows(app):
-            found = find_descendant(window, lambda e: button_text_is(e, MANAGER_TITLE))
-            if found:
-                return found
-        return None
+            portfolio_button = find_descendant(
+                window,
+                lambda e: button_text_is(e, "组合") and ax_rect(e) and ax_rect(e).x < 140,
+            )
+            if portfolio_button:
+                press(portfolio_button)
+                break
 
-    button = wait_for(manager_button, timeout=2.5)
+        button = wait_for(lambda: find_manager_button(app), timeout=2.5)
     if not button:
         raise RuntimeError("Could not find the '组合管理' button. Is the Portfolio page open?")
     press(button)
@@ -323,6 +382,38 @@ def visible_text_fields(window) -> list:
     ]
 
 
+def left_search_results(window):
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    for child in ax_children(window):
+        rect = ax_rect(child)
+        if (
+            ax_get(child, AX.kAXRoleAttribute) == AX.kAXScrollAreaRole
+            and rect
+            and visible_in(child, win_rect)
+            and rect.x < win_rect.x + win_rect.w * 0.45
+        ):
+            return child
+    return None
+
+
+def right_position_area(window):
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    for child in ax_children(window):
+        rect = ax_rect(child)
+        if (
+            ax_get(child, AX.kAXRoleAttribute) == AX.kAXScrollAreaRole
+            and rect
+            and visible_in(child, win_rect)
+            and rect.x > win_rect.x + win_rect.w * 0.35
+        ):
+            return child
+    return None
+
+
 def find_search_field(window):
     win_rect = ax_rect(window)
     # The stock search box is a direct child of the manager window. Avoid a
@@ -339,21 +430,82 @@ def find_search_field(window):
     return sorted(candidates, key=lambda f: ax_rect(f).y)[0]
 
 
+def find_first_position_field(window):
+    win_rect = ax_rect(window)
+    area = right_position_area(window)
+    if win_rect is None or area is None:
+        return None
+
+    fields = []
+    for item in walk(area):
+        if ax_get(item, AX.kAXRoleAttribute) != AX.kAXTextFieldRole:
+            continue
+        rect = ax_rect(item)
+        if rect and visible_in(item, win_rect):
+            fields.append(item)
+    if not fields:
+        return None
+    return sorted(fields, key=lambda item: (ax_rect(item).y, ax_rect(item).x))[0]
+
+
+def first_position_symbol(window) -> str:
+    area = right_position_area(window)
+    area_rect = ax_rect(area) if area else None
+    win_rect = ax_rect(window)
+    if area is None or area_rect is None or win_rect is None:
+        return ""
+
+    symbols: list[tuple[float, float, str]] = []
+    for item in walk(area):
+        if ax_get(item, AX.kAXRoleAttribute) != AX.kAXStaticTextRole:
+            continue
+        value = ax_get(item, AX.kAXValueAttribute)
+        rect = ax_rect(item)
+        if (
+            isinstance(value, str)
+            and value
+            and rect
+            and visible_in(item, win_rect)
+            and area_rect.x <= rect.x <= area_rect.x + 100
+            and area_rect.y <= rect.y <= area_rect.y + 55
+        ):
+            symbols.append((rect.y, rect.x, value))
+    if not symbols:
+        return ""
+    return sorted(symbols)[0][2].upper()
+
+
+def find_first_search_checkbox(window):
+    source = left_search_results(window)
+    if source is None:
+        return None
+    for item in walk(source):
+        if ax_get(item, AX.kAXRoleAttribute) == AX.kAXCheckBoxRole:
+            return item
+    return None
+
+
+def find_first_matching_search_checkbox(window, symbol: str):
+    checkbox = find_first_search_checkbox(window)
+    title = ax_get(checkbox, AX.kAXTitleAttribute) if checkbox else None
+    if isinstance(title, str) and title.upper() == symbol.upper():
+        return checkbox
+    return None
+
+
 def find_visible_checkbox(window, symbol: str):
     win_rect = ax_rect(window)
     target = symbol.upper()
-    matches = []
-    for item in walk(window):
+    source = left_search_results(window) or window
+    for item in walk(source):
         if ax_get(item, AX.kAXRoleAttribute) != AX.kAXCheckBoxRole:
             continue
         title = ax_get(item, AX.kAXTitleAttribute)
         if not isinstance(title, str) or title.upper() != target:
             continue
         if visible_in(item, win_rect):
-            matches.append(item)
-    if not matches:
-        return None
-    return sorted(matches, key=lambda e: (ax_rect(e).y, ax_rect(e).x))[0]
+            return item
+    return None
 
 
 def selected_count_text(window) -> str:
@@ -397,6 +549,35 @@ def find_position_field(window, symbol: str):
             return sorted(same_row, key=lambda f: ax_rect(f).x)[0]
 
     return sorted(fields, key=lambda f: (ax_rect(f).y, ax_rect(f).x))[0]
+
+
+def find_existing_position_field(window, symbol: str):
+    first_field = find_first_position_field(window)
+    if not first_field:
+        return None
+    if first_position_symbol(window) == symbol.upper():
+        return first_field
+
+    win_rect = ax_rect(window)
+    if win_rect is None:
+        return None
+    rows = position_row_centers(window, symbol)
+    if not rows:
+        return None
+
+    fields = [
+        f
+        for f in walk_right_side(window)
+        if ax_get(f, AX.kAXRoleAttribute) == AX.kAXTextFieldRole
+        and ax_rect(f)
+        and visible_in(f, win_rect)
+        and ax_rect(f).x > win_rect.x + win_rect.w * 0.55
+    ]
+    row_y = rows[0]
+    same_row = [f for f in fields if abs(ax_rect(f).cy - row_y) < 18]
+    if not same_row:
+        return None
+    return sorted(same_row, key=lambda f: ax_rect(f).x)[0]
 
 
 def position_row_centers(window, symbol: str) -> list[float]:
@@ -452,6 +633,91 @@ def find_delete_button(window, symbol: str):
     return sorted(buttons, key=lambda button: abs(ax_rect(button).cy - row_y))[0]
 
 
+def format_percent(value) -> str:
+    text = "" if value is None else str(value).strip().rstrip("%").strip()
+    if not text:
+        return ""
+    try:
+        return f"{float(text):.2f}%"
+    except ValueError:
+        return f"{text}%"
+
+
+def position_row_details(window, symbol: str) -> dict[str, str]:
+    win_rect = ax_rect(window)
+    rows = position_row_centers(window, symbol)
+    if win_rect is None or not rows:
+        return {"name": "", "percent": ""}
+
+    row_y = rows[0]
+    row_texts: list[tuple[float, str]] = []
+    row_fields = []
+    for item in walk_right_side(window):
+        rect = ax_rect(item)
+        if not rect or not visible_in(item, win_rect) or abs(rect.cy - row_y) >= 24:
+            continue
+        role = ax_get(item, AX.kAXRoleAttribute)
+        value = ax_get(item, AX.kAXValueAttribute)
+        if role == AX.kAXStaticTextRole and isinstance(value, str) and value:
+            row_texts.append((rect.x, value))
+        elif role == AX.kAXTextFieldRole:
+            row_fields.append(item)
+
+    row_texts.sort(key=lambda item: item[0])
+    target = symbol.upper()
+    name = ""
+    for index, (_, value) in enumerate(row_texts):
+        if value.upper() == target:
+            for _, next_value in row_texts[index + 1 :]:
+                if next_value not in {"%", "美股", "港股", "沪深"}:
+                    name = next_value
+                    break
+            break
+
+    percent = ""
+    if row_fields:
+        field = sorted(row_fields, key=lambda item: ax_rect(item).x)[0]
+        percent = format_percent(ax_get(field, AX.kAXValueAttribute))
+
+    return {"name": name, "percent": percent}
+
+
+def record_file_path() -> Path:
+    return Path(__file__).resolve().with_name(RECORD_FILENAME)
+
+
+def append_rebalance_record(
+    *,
+    symbol: str,
+    stock_name: str,
+    before_percent: str,
+    after_percent: str,
+    price: str = "",
+    note: str = "",
+    path: Optional[Path] = None,
+) -> Path:
+    output_path = path or record_file_path()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    should_write_header = not output_path.exists() or output_path.stat().st_size == 0
+    now = datetime.now()
+    row = [
+        now.strftime("%Y/%m/%d"),
+        now.strftime("%H:%M:%S"),
+        stock_name,
+        symbol.upper(),
+        before_percent,
+        after_percent,
+        price,
+        note,
+    ]
+    with output_path.open("a", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file)
+        if should_write_header:
+            writer.writerow(RECORD_HEADER)
+        writer.writerow(row)
+    return output_path
+
+
 def find_confirm_button(window):
     win_rect = ax_rect(window)
     candidates = []
@@ -486,55 +752,100 @@ def find_confirm_button(window):
     return sorted(candidates, key=lambda e: (ax_rect(e).y, ax_rect(e).x), reverse=True)[0]
 
 
-def build_position(symbol: str, percent: str, dry_run: bool = False) -> None:
+def elapsed_seconds(started_at: float) -> str:
+    return f"{time.perf_counter() - started_at:.2f}s"
+
+
+def build_position(
+    symbol: str,
+    percent: str,
+    dry_run: bool = False,
+    record: bool = True,
+    started_at: Optional[float] = None,
+) -> None:
     check_accessibility_permission()
     pid = get_pid()
-    activate_app()
     app = AX.AXUIElementCreateApplication(pid)
+    activate_app(app)
 
     manager = open_manager(app)
-    focus_window(app, manager)
-    search = find_search_field(manager)
-    replace_text(search, symbol)
+    position_field = find_existing_position_field(manager, symbol)
+    if not position_field:
+        search = find_search_field(manager)
+        replace_text(search, symbol, settle=SEARCH_RESULT_SETTLE)
 
-    checkbox = wait_for(lambda: find_visible_checkbox(manager, symbol), timeout=3.0)
-    if not checkbox:
-        raise RuntimeError(f"Could not find a visible search result for {symbol!r}.")
+        position_field = None
+        checkbox = find_first_matching_search_checkbox(manager, symbol)
+        if not checkbox:
+            checkbox = wait_for(
+                lambda: find_first_matching_search_checkbox(manager, symbol),
+                timeout=0.4,
+                interval=0.01,
+            )
+        if checkbox and mouse_click_point(search_result_checkbox_point(manager)):
+            time.sleep(ROW_SETTLE)
+            position_field = wait_for(lambda: find_first_position_field(manager), timeout=0.25)
 
-    if ax_get(checkbox, AX.kAXValueAttribute) != 1:
-        press(checkbox)
-        wait_for(lambda: "已选择" in selected_count_text(manager), timeout=1.0)
-        time.sleep(0.12)
-
-    position_field = wait_for(lambda: find_position_field(manager, symbol), timeout=2.0)
+        if not position_field:
+            checkbox = checkbox or wait_for(lambda: find_visible_checkbox(manager, symbol), timeout=2.0)
+            if not checkbox:
+                raise RuntimeError(f"Could not find a visible search result for {symbol!r}.")
+            mouse_click(checkbox)
+            time.sleep(ROW_SETTLE)
+            position_field = wait_for(lambda: find_first_position_field(manager), timeout=0.6)
+            if not position_field:
+                position_field = wait_for(lambda: find_position_field(manager, symbol), timeout=1.0)
+    if not position_field:
+        raise RuntimeError("Could not find the position percentage field after selecting the stock.")
+    if record:
+        details = position_row_details(manager, symbol)
+        before_percent = details["percent"] or format_percent(ax_get(position_field, AX.kAXValueAttribute))
+        after_percent = format_percent(percent)
     replace_text(position_field, percent)
 
     if dry_run:
         print(f"Dry run complete: {symbol.upper()} is selected and position is set to {percent}%.")
         return
 
-    confirm = find_confirm_button(manager)
-    # Futu's custom confirm button can report AXPress success without firing.
-    # A real mouse click on the button center is more reliable here.
-    mouse_click(confirm)
+    if not mouse_click_point(confirm_button_point(manager)):
+        confirm = find_confirm_button(manager)
+        # Futu's custom confirm button can report AXPress success without firing.
+        # A real mouse click on the button center is more reliable here.
+        mouse_click(confirm)
     closed = wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=2.0)
     if not closed:
         raise RuntimeError("Clicked confirm, but the manager window is still open.")
-    print(f"Done: {symbol.upper()} position set to {percent}%.")
+    if record:
+        path = append_rebalance_record(
+            symbol=symbol,
+            stock_name=details["name"],
+            before_percent=before_percent,
+            after_percent=after_percent,
+        )
+        print(f"Record written: {path}")
+    elapsed = f" Elapsed: {elapsed_seconds(started_at)}." if started_at is not None else ""
+    print(f"Done: {symbol.upper()} position set to {percent}%.{elapsed}")
 
 
-def close_position(symbol: str, dry_run: bool = False) -> None:
+def close_position(
+    symbol: str,
+    dry_run: bool = False,
+    record: bool = True,
+    started_at: Optional[float] = None,
+) -> None:
     check_accessibility_permission()
     pid = get_pid()
-    activate_app()
     app = AX.AXUIElementCreateApplication(pid)
+    activate_app(app)
 
     manager = open_manager(app)
-    focus_window(app, manager)
 
     delete_button = wait_for(lambda: find_delete_button(manager, symbol), timeout=2.0)
     if not delete_button:
         raise RuntimeError(f"Could not find {symbol.upper()} in the current portfolio rows.")
+    if record:
+        details = position_row_details(manager, symbol)
+        before_percent = details["percent"]
 
     if dry_run:
         rect = ax_rect(delete_button)
@@ -547,12 +858,22 @@ def close_position(symbol: str, dry_run: bool = False) -> None:
     mouse_click(delete_button)
     wait_for(lambda: not position_row_centers(manager, symbol), timeout=1.0)
 
-    confirm = find_confirm_button(manager)
-    mouse_click(confirm)
+    if not mouse_click_point(confirm_button_point(manager)):
+        confirm = find_confirm_button(manager)
+        mouse_click(confirm)
     closed = wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=2.0)
     if not closed:
         raise RuntimeError("Clicked confirm, but the manager window is still open.")
-    print(f"Done: {symbol.upper()} was removed from the portfolio.")
+    if record:
+        path = append_rebalance_record(
+            symbol=symbol,
+            stock_name=details["name"],
+            before_percent=before_percent,
+            after_percent="0.00%",
+        )
+        print(f"Record written: {path}")
+    elapsed = f" Elapsed: {elapsed_seconds(started_at)}." if started_at is not None else ""
+    print(f"Done: {symbol.upper()} was removed from the portfolio.{elapsed}")
 
 
 def is_close_target(value: str) -> bool:
@@ -566,6 +887,7 @@ def is_close_target(value: str) -> bool:
 
 
 def main(argv: list[str]) -> int:
+    started_at = COMMAND_STARTED_AT
     parser = argparse.ArgumentParser(
         description="Set or remove one stock in FutuNiuniu Portfolio Manager."
     )
@@ -576,6 +898,13 @@ def main(argv: list[str]) -> int:
         help="Optional target percentage, or close/delete/0 to remove the row.",
     )
     parser.add_argument("--percent", default="100", help="Target position percentage, default: 100")
+    parser.add_argument(
+        "--no-record",
+        dest="record",
+        action="store_false",
+        default=True,
+        help="Do not append fabu_utils/alpha_second.csv after a successful change.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -588,15 +917,27 @@ def main(argv: list[str]) -> int:
     if not symbol:
         raise SystemExit("Symbol cannot be empty.")
 
+    should_record = args.record
     if target and is_close_target(target):
-        close_position(symbol=symbol, dry_run=args.dry_run)
+        close_position(
+            symbol=symbol,
+            dry_run=args.dry_run,
+            record=should_record,
+            started_at=started_at,
+        )
         return 0
 
     percent = str(target if target else args.percent).strip().rstrip("%")
     if not percent:
         raise SystemExit("Percent cannot be empty.")
 
-    build_position(symbol=symbol, percent=percent, dry_run=args.dry_run)
+    build_position(
+        symbol=symbol,
+        percent=percent,
+        dry_run=args.dry_run,
+        record=should_record,
+        started_at=started_at,
+    )
     return 0
 
 
