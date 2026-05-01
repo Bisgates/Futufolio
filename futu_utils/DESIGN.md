@@ -10,6 +10,7 @@ Automate a repeatable portfolio operation in FutuNiuniu on macOS:
 4. Set the target position percentage.
 5. Confirm the change.
 6. Support close/removal by clicking the row's trash icon.
+7. Append a rebalance record after successful confirmation.
 
 Primary command examples:
 
@@ -17,6 +18,7 @@ Primary command examples:
 python3 fabu_utils/futu_portfolio.py MSFT 100
 python3 fabu_utils/futu_portfolio.py MSFT close
 python3 fabu_utils/futu_portfolio.py MSFT 0
+python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
 ```
 
 ## Scope
@@ -32,6 +34,28 @@ Supported actions:
 | Close/remove position | `python3 fabu_utils/futu_portfolio.py MSFT close` | Click the row trash icon, then confirm |
 | Close/remove alias | `python3 fabu_utils/futu_portfolio.py MSFT 0` | Same as `close`; does not type `0` into the position box |
 | Dry run | `python3 fabu_utils/futu_portfolio.py MSFT --dry-run` | Fill/select but do not click final confirm |
+| Skip record | `python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record` | Confirm the UI operation but do not append `alpha_second.csv` |
+
+## Rebalance Record
+
+After a successful confirmed operation, the script appends a row to:
+
+```bash
+fabu_utils/alpha_second.csv
+```
+
+The file uses the same column format as `/Volumes/ssd/us_stock_data/TriggerData/多空.csv`:
+
+```csv
+日期,时间,股票名称,代码,变化前持仓,变化后持仓,成交价,说明
+```
+
+Record behavior:
+
+- The file is created next to `futu_portfolio.py` if it does not exist.
+- `成交价` is left blank because the UI automation flow does not always expose a reliable execution price.
+- `--dry-run` never writes a record because it does not click final confirm.
+- `--no-record` skips recording.
 
 ## Implementation
 
