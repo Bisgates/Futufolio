@@ -1,50 +1,116 @@
-# Futu Portfolio Automation Design
+# Futu Portfolio Rebalance Design
+
+## Design Principle
+
+This project follows a small-interface, data-first style inspired by Peter Norvig:
+
+1. Keep the public interface obvious.
+2. Represent intent as data.
+3. Keep command parsing, business workflow, and UI mechanics separate.
+4. Optimize the hot path, but keep safety checks around fixed-position clicks.
+5. Prefer boring modules over a framework.
 
 ## Goal
 
-Automate a repeatable portfolio operation in FutuNiuniu on macOS:
+Automate a repeatable single-symbol portfolio rebalance operation in FutuNiuniu on macOS:
 
 1. Open the Portfolio Manager window.
-2. Search for a stock code.
-3. Select the exact search result.
-4. Set the target position percentage.
-5. Confirm the change.
-6. Support close/removal by clicking the row's trash icon.
-7. Append a rebalance record after successful confirmation.
+2. Optionally select a portfolio by code.
+3. Search for a stock code when it is not already in the current portfolio rows.
+4. Select the exact search result.
+5. Set the target position percentage.
+6. Confirm the change.
+7. Support close/removal by clicking the row's trash icon.
+8. Optionally append a rebalance record only when requested.
 
-Primary command examples:
+## Public Interfaces
+
+### CLI
 
 ```bash
-python3 fabu_utils/futu_portfolio.py MSFT 100
-python3 fabu_utils/futu_portfolio.py MSFT close
-python3 fabu_utils/futu_portfolio.py MSFT 0
-python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
+uv run futu-portfolio MSFT 100
+uv run futu-portfolio MSFT close
+uv run futu-portfolio MSFT 50 --portfolio PFL0137605
 ```
 
-## Scope
+Compatibility entrypoints:
 
-This utility controls the FutuNiuniu desktop UI. It is not a Futu OpenAPI client and does not submit brokerage orders directly.
+```bash
+python3 futu_portfolio.py MSFT 100
+python3 futu_utils/futu_portfolio.py MSFT 100
+python3 -m futu_utils MSFT 100
+```
 
-Supported actions:
+### Python API
+
+```python
+from futu_utils import FutuPortfolioClient
+
+client = FutuPortfolioClient()
+client.set_position("MSFT", 50)
+client.close_position("MSFT")
+```
+
+Stable command-object interface:
+
+```python
+from futu_utils import FutuPortfolioClient, RebalanceAction, RebalanceCommand
+
+command = RebalanceCommand(symbol="MSFT", action=RebalanceAction.SET, percent="50")
+result = FutuPortfolioClient().rebalance(command)
+```
+
+`RebalanceCommand` is the boundary object. Lower-level modules may change, but external callers should not need to change.
+
+## Module Boundaries
+
+| Layer | Module | Responsibility |
+| --- | --- | --- |
+| Public API | `api.py`, `models.py` | Stable objects and client methods for external scripts |
+| CLI | `cli.py`, `__main__.py`, entrypoint scripts | Parse arguments and print `RebalanceResult` lines |
+| Use case | `rebalance.py` | Execute set/remove workflows and return results |
+| Futu app | `futu_app.py`, `portfolio_selector.py` | Activate app, select portfolio, open manager |
+| UI selectors | `manager_ui.py` | Locate manager controls and rows |
+| AX runtime | `ax_utils.py`, `pyobjc_runtime.py` | Accessibility traversal, clicking, typing, permission checks |
+| Persistence | `recorder.py` | Optional CSV append only |
+
+## Command Flow
+
+```mermaid
+flowchart TD
+    A["CLI args or Python API"] --> B["RebalanceCommand"]
+    B --> C["FutuPortfolioClient.rebalance"]
+    C --> D["rebalance.run_rebalance_command"]
+    D --> E["select portfolio and open manager"]
+    E --> F{"action"}
+    F -->|set| G["find/search symbol and set percent"]
+    F -->|close| H["find row delete button"]
+    G --> I["confirm or dry run"]
+    H --> I
+    I --> J["optional record.csv"]
+    J --> K["RebalanceResult"]
+```
+
+## Supported Actions
 
 | Action | Example | Behavior |
 | --- | --- | --- |
-| Build/default position | `python3 fabu_utils/futu_portfolio.py MSFT` | Set `MSFT` to `100%` |
-| Set custom position | `python3 fabu_utils/futu_portfolio.py MSFT 50` | Set `MSFT` to `50%` |
-| Close/remove position | `python3 fabu_utils/futu_portfolio.py MSFT close` | Click the row trash icon, then confirm |
-| Close/remove alias | `python3 fabu_utils/futu_portfolio.py MSFT 0` | Same as `close`; does not type `0` into the position box |
-| Dry run | `python3 fabu_utils/futu_portfolio.py MSFT --dry-run` | Fill/select but do not click final confirm |
-| Skip record | `python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record` | Confirm the UI operation but do not append `alpha_second.csv` |
+| Build/default position | `uv run futu-portfolio MSFT` | Set `MSFT` to `100%` |
+| Set custom position | `uv run futu-portfolio MSFT 50` | Set `MSFT` to `50%` |
+| Close/remove position | `uv run futu-portfolio MSFT close` | Click row trash icon, then confirm |
+| Close/remove alias | `uv run futu-portfolio MSFT 0` | Same as `close`; does not type `0` into the position box |
+| Dry run | `uv run futu-portfolio MSFT --dry-run` | Fill/select but do not click final confirm |
+| Optional record | `uv run futu-portfolio MSFT 100 --record` | Confirm the UI operation and append `record.csv` |
 
 ## Rebalance Record
 
-After a successful confirmed operation, the script appends a row to:
+Confirmed operations are not recorded by default. When recording is requested, the script appends a row to:
 
 ```bash
-fabu_utils/alpha_second.csv
+futu_utils/record.csv
 ```
 
-The file uses the same column format as `/Volumes/ssd/us_stock_data/TriggerData/多空.csv`:
+The file uses this column format:
 
 ```csv
 日期,时间,股票名称,代码,变化前持仓,变化后持仓,成交价,说明
@@ -52,72 +118,27 @@ The file uses the same column format as `/Volumes/ssd/us_stock_data/TriggerData/
 
 Record behavior:
 
-- The file is created next to `futu_portfolio.py` if it does not exist.
+- The file is created next to `recorder.py` if it does not exist.
 - `成交价` is left blank because the UI automation flow does not always expose a reliable execution price.
 - `--dry-run` never writes a record because it does not click final confirm.
-- `--no-record` skips recording.
+- `--no-record` is accepted for compatibility, but no-record is already the default.
 
-## Implementation
+## Hot-Path Performance Rules
 
-The script uses macOS Accessibility APIs through PyObjC:
+The fast path is intentionally narrow:
 
-- `ApplicationServices` for Accessibility tree traversal and element actions.
-- `Quartz` for reliable mouse and keyboard events.
-- `pbcopy` for clipboard-based text input, because Futu's custom fields accept pasted text more reliably than raw key events.
+- Reuse the existing row when the symbol is already in the right-side table.
+- Scan the right pane for close/remove instead of scanning the full Accessibility tree.
+- Use direct `AXValue` text setting first, clipboard paste only as fallback.
+- Click fixed-position search result / percent field / confirm points only after nearby safety checks.
+- Preserve elapsed-time output for benchmarking.
 
-Main UI controls used:
-
-| UI Element | Detection Method |
-| --- | --- |
-| Portfolio tab | `AXButton` with label/description containing `组合` |
-| Portfolio Manager button | `AXButton` containing `组合管理` |
-| Manager window | `AXWindow` title `组合管理` |
-| Search field | Left-side direct `AXTextField` in the manager window |
-| Search result checkbox | Visible `AXCheckBox` whose title matches the stock symbol |
-| Position input | Right-side visible `AXTextField` on the selected symbol row |
-| Delete/trash icon | Right-side `AXButton` with description `paint_tool_delete` |
-| Confirm button | `AXButton` with description `pub_button_default` |
-
-## Close Behavior
-
-Close is intentionally implemented as a row deletion:
-
-1. Open `组合管理`.
-2. Locate the current holding row on the right side by exact symbol text.
-3. Locate the row's `paint_tool_delete` button.
-4. Click the trash icon.
-5. Click the confirm button.
-6. Verify the manager window closes.
-
-This matches the intended UI behavior and avoids treating `0` as a position percentage.
-
-## Speed Notes
-
-The script avoids scanning the full Accessibility tree when possible, because Futu may expose a long off-screen watchlist on the left side. For close/removal, it scans only the right side of the manager window.
-
-Observed local timings during validation:
-
-- Open/build/confirm flow: about 2 to 3 seconds.
-- Close/remove flow after optimization: about 1 second.
-
-Actual timing depends on Futu UI refresh speed and macOS Accessibility response time.
-
-## Requirements
-
-- macOS.
-- `/Applications/FutuNiuniu.app` installed.
-- Python 3 with PyObjC modules available.
-- Accessibility permission granted to the terminal app running the script.
-
-If PyObjC is missing:
-
-```bash
-python3 -m pip install pyobjc
-```
+See `performance.md` for measured local results and benchmark commands.
 
 ## Safety and Limitations
 
-- This is GUI automation, so UI layout changes in FutuNiuniu can break selectors.
-- The script checks that the manager window closes after confirm, but it does not verify backend portfolio state through an API.
-- Avoid moving/clicking the mouse while the script is running.
-- Use `--dry-run` before changing a new symbol or after FutuNiuniu updates.
+- This controls the FutuNiuniu desktop UI through macOS Accessibility.
+- It is not a trading API and does not submit brokerage orders directly.
+- UI layout changes in FutuNiuniu can break selectors.
+- Confirmation checks verify that the manager window closes, not backend portfolio state.
+- The user should avoid moving the mouse during execution.

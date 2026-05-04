@@ -15,11 +15,10 @@ The performance target is:
 
 Use a real confirm. Do not use `--dry-run` for performance testing.
 
-Always include `--no-record` so speed tests do not append rows to
-`fabu_utils/alpha_second.csv`.
+Rebalance changes are not recorded by default, so the normal timing command is:
 
 ```bash
-/usr/bin/time -p python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
+/usr/bin/time -p python3 futu_utils/futu_portfolio.py MSFT 100
 ```
 
 The success line also prints script-measured elapsed time:
@@ -28,14 +27,16 @@ The success line also prints script-measured elapsed time:
 Done: MSFT position set to 100%. Elapsed: 0.78s.
 ```
 
+If you explicitly test recording overhead, add `--record`; that writes `futu_utils/record.csv`.
+
 ## Repeat Test
 
 Do not use repeated builds to measure first-build speed. If a symbol has
 already been built once, delete it first, then measure the next build:
 
 ```bash
-python3 fabu_utils/futu_portfolio.py MSFT close --no-record
-/usr/bin/time -p python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
+python3 futu_utils/futu_portfolio.py MSFT close
+/usr/bin/time -p python3 futu_utils/futu_portfolio.py MSFT 100
 ```
 
 Use the repeat loop only for the existing-row hot path:
@@ -43,7 +44,7 @@ Use the repeat loop only for the existing-row hot path:
 ```bash
 for i in 1 2 3 4 5; do
   echo "run $i"
-  /usr/bin/time -p python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
+  /usr/bin/time -p python3 futu_utils/futu_portfolio.py MSFT 100
 done
 ```
 
@@ -66,8 +67,8 @@ Conclusion: the hot path is now below 1 second on the local machine.
 Measured with the required close-then-build flow:
 
 ```bash
-python3 fabu_utils/futu_portfolio.py MSFT close --no-record
-/usr/bin/time -p python3 fabu_utils/futu_portfolio.py MSFT 100 --no-record
+python3 futu_utils/futu_portfolio.py MSFT close
+/usr/bin/time -p python3 futu_utils/futu_portfolio.py MSFT 100
 ```
 
 Latest local result:
