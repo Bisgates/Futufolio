@@ -8,6 +8,7 @@ Usage:
     python3 futu_portfolio.py MSFT 0
     python3 futu_portfolio.py MSFT 100 --no-record
     python3 futu_portfolio.py MSFT --percent 100 --dry-run
+    python3 futu_portfolio.py MSFT 50 --portfolio PFL0137605
 
 This script drives the existing FutuNiuniu UI via macOS Accessibility.
 It does not use a trading API and does not place real brokerage orders.
@@ -17,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
+import re
 import subprocess
 import sys
 import time
@@ -25,17 +28,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-# Keep this before PyObjC imports so the final elapsed time includes most
-# command startup and import overhead.
+# Keep this near the top so the final elapsed time includes most command startup
+# and import overhead.
 COMMAND_STARTED_AT = time.perf_counter()
-
-try:
-    import ApplicationServices as AX
-    import Quartz
-except ImportError as exc:  # pragma: no cover - environment-specific
-    raise SystemExit(
-        "Missing PyObjC modules. Install with: python3 -m pip install pyobjc"
-    ) from exc
 
 PROCESS_NAME = "FutuNiuniu"
 APP_PATH = "/Applications/FutuNiuniu.app"
@@ -43,15 +38,19 @@ APPLESCRIPT_NAME = "FutuNiuniu"
 MANAGER_TITLE = "组合管理"
 RECORD_FILENAME = "alpha_second.csv"
 RECORD_HEADER = ["日期", "时间", "股票名称", "代码", "变化前持仓", "变化后持仓", "成交价", "说明"]
+PORTFOLIO_CODE_RE = re.compile(r"PFL\d+", re.IGNORECASE)
 
 KEY_A = 0
 KEY_V = 9
 KEY_DELETE = 51
-CMD = Quartz.kCGEventFlagMaskCommand
+AX = None
+Quartz = None
+CMD = 0
 EVENT_PAUSE = 0.003
 FOCUS_SETTLE = 0.01
 SEARCH_RESULT_SETTLE = 0.24
 ROW_SETTLE = 0.02
+PORTFOLIO_SETTLE = 0.15
 
 
 @dataclass(frozen=True)
@@ -78,7 +77,26 @@ class Rect:
         return self.y + self.h
 
 
+def load_pyobjc() -> None:
+    global AX, Quartz, CMD
+    if AX is not None and Quartz is not None:
+        return
+
+    try:
+        import ApplicationServices as loaded_ax
+        import Quartz as loaded_quartz
+    except ImportError as exc:  # pragma: no cover - environment-specific
+        raise SystemExit(
+            "Missing PyObjC modules. Install with: python3 -m pip install pyobjc"
+        ) from exc
+
+    AX = loaded_ax
+    Quartz = loaded_quartz
+    CMD = Quartz.kCGEventFlagMaskCommand
+
+
 def check_accessibility_permission() -> None:
+    load_pyobjc()
     opts = {AX.kAXTrustedCheckOptionPrompt: True}
     if not AX.AXIsProcessTrustedWithOptions(opts):
         raise SystemExit(
@@ -331,12 +349,319 @@ def button_text_is(element, label: str) -> bool:
     return label in ax_text(element)
 
 
+def find_portfolio_nav_button(app):
+    for window in windows(app):
+        portfolio_button = find_descendant(
+            window,
+            lambda e: button_text_is(e, "组合") and ax_rect(e) and ax_rect(e).x < 140,
+        )
+        if portfolio_button:
+            return portfolio_button
+    return None
+
+
 def find_manager_button(app):
     for window in windows(app):
         found = find_descendant(window, lambda e: button_text_is(e, MANAGER_TITLE))
         if found:
             return found
     return None
+
+
+def find_sheet(window):
+    sheet_role = getattr(AX, "kAXSheetRole", "AXSheet")
+    return find_descendant(window, lambda e: ax_get(e, AX.kAXRoleAttribute) == sheet_role)
+
+
+def find_button_by_description(element, description: str, *, prefer_right: bool = False):
+    buttons = []
+    for item in walk(element):
+        if ax_get(item, AX.kAXRoleAttribute) != AX.kAXButtonRole:
+            continue
+        if ax_get(item, AX.kAXDescriptionAttribute) != description:
+            continue
+        rect = ax_rect(item)
+        if rect:
+            buttons.append(item)
+    if not buttons:
+        return None
+    return sorted(buttons, key=lambda item: ax_rect(item).x, reverse=prefer_right)[0]
+
+
+def click_manager_sheet_choice(manager, *, save: bool) -> bool:
+    sheet = find_sheet(manager)
+    if not sheet:
+        return False
+    description = "pub_button_default" if save else "pub_button_normal"
+    button = find_button_by_description(sheet, description, prefer_right=save)
+    if not button:
+        return False
+    mouse_click(button)
+    return True
+
+
+def close_manager_without_saving(app) -> bool:
+    manager = find_window(app, MANAGER_TITLE)
+    if not manager:
+        return True
+
+    focus_window(app, manager)
+    if click_manager_sheet_choice(manager, save=False):
+        return bool(wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=1.5))
+
+    cancel = find_button_by_description(manager, "pub_button_normal", prefer_right=False)
+    if not cancel:
+        return False
+    mouse_click(cancel)
+
+    def closed_or_sheet():
+        current = find_window(app, MANAGER_TITLE)
+        if not current:
+            return True
+        sheet = find_sheet(current)
+        return sheet or None
+
+    result = wait_for(closed_or_sheet, timeout=1.0)
+    if result is True:
+        return True
+
+    manager = find_window(app, MANAGER_TITLE)
+    if manager and click_manager_sheet_choice(manager, save=False):
+        return bool(wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=1.5))
+    return False
+
+
+def ensure_portfolio_page(app) -> None:
+    portfolio_button = find_portfolio_nav_button(app)
+    if portfolio_button:
+        press(portfolio_button)
+        wait_for(lambda: find_manager_button(app), timeout=2.5)
+
+
+def element_text_values(element) -> list[str]:
+    values: list[str] = []
+    for attr in (
+        AX.kAXTitleAttribute,
+        AX.kAXDescriptionAttribute,
+        AX.kAXValueAttribute,
+        AX.kAXIdentifierAttribute,
+    ):
+        value = ax_get(element, attr)
+        if isinstance(value, str) and value:
+            values.append(value)
+    return values
+
+
+def element_matches_portfolio_code(element, portfolio_code: str) -> bool:
+    target = portfolio_code.strip().upper()
+    if not target:
+        return False
+
+    for value in element_text_values(element):
+        normalized = value.strip().upper()
+        codes = [match.upper() for match in PORTFOLIO_CODE_RE.findall(normalized)]
+        if target in codes or normalized == target or target in normalized.split():
+            return True
+    return False
+
+
+def visible_portfolio_codes(app) -> list[str]:
+    found: set[str] = set()
+    for window in windows(app):
+        if ax_get(window, AX.kAXTitleAttribute) == MANAGER_TITLE:
+            continue
+        win_rect = ax_rect(window)
+        if win_rect is None:
+            continue
+        for item in walk(window):
+            rect = ax_rect(item)
+            if not rect or not visible_in(item, win_rect):
+                continue
+            for value in element_text_values(item):
+                found.update(match.upper() for match in PORTFOLIO_CODE_RE.findall(value))
+    return sorted(found)
+
+
+def portfolio_list_rect(app) -> Optional[Rect]:
+    for window in windows(app):
+        win_rect = ax_rect(window)
+        if win_rect is None:
+            continue
+        for item in walk(window):
+            if ax_get(item, AX.kAXRoleAttribute) != AX.kAXTableRole:
+                continue
+            rect = ax_rect(item)
+            desc = ax_get(item, AX.kAXDescriptionAttribute)
+            identifier = ax_get(item, AX.kAXIdentifierAttribute)
+            if (
+                rect
+                and visible_in(item, win_rect)
+                and rect.x < win_rect.x + win_rect.w * 0.35
+                and (
+                    desc == "gridView"
+                    or identifier == "accessibility.futu.FTQPortfolioGridViewController"
+                )
+            ):
+                return rect
+    return None
+
+
+def find_visible_portfolio_code(app, portfolio_code: str):
+    candidates = []
+    for window in windows(app):
+        if ax_get(window, AX.kAXTitleAttribute) == MANAGER_TITLE:
+            continue
+        win_rect = ax_rect(window)
+        if win_rect is None:
+            continue
+        for item in walk(window):
+            rect = ax_rect(item)
+            if not rect or not visible_in(item, win_rect):
+                continue
+            if element_matches_portfolio_code(item, portfolio_code):
+                candidates.append((rect.w * rect.h, rect.y, rect.x, item))
+    if not candidates:
+        return None
+    # Prefer the smallest matching visible element. In Futu's list this is
+    # usually the code label itself, which is a safe click target for the row.
+    return sorted(candidates, key=lambda candidate: candidate[:3])[0][3]
+
+
+def futu_window_info():
+    pid = int(subprocess.check_output(["pgrep", "-x", PROCESS_NAME]).splitlines()[0])
+    window_infos = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID,
+    )
+    candidates = [
+        info
+        for info in window_infos
+        if info.get("kCGWindowOwnerPID") == pid
+        and info.get("kCGWindowLayer") == 0
+        and info.get("kCGWindowIsOnscreen")
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda info: info["kCGWindowBounds"]["Width"] * info["kCGWindowBounds"]["Height"],
+    )
+
+
+def capture_futu_window_image():
+    info = futu_window_info()
+    if info is None:
+        return None, None
+    image = Quartz.CGWindowListCreateImage(
+        Quartz.CGRectNull,
+        Quartz.kCGWindowListOptionIncludingWindow,
+        info["kCGWindowNumber"],
+        Quartz.kCGWindowImageBoundsIgnoreFraming,
+    )
+    return image, info
+
+
+def ocr_click_portfolio_code(app, portfolio_code: str) -> bool:
+    try:
+        import Vision
+    except ImportError:
+        return False
+
+    image, info = capture_futu_window_image()
+    list_rect = portfolio_list_rect(app)
+    if image is None or info is None or list_rect is None:
+        return False
+
+    request = Vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    request.setUsesLanguageCorrection_(False)
+    if hasattr(request, "setRecognitionLanguages_"):
+        request.setRecognitionLanguages_(["en-US", "zh-Hans"])
+
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(image, {})
+    success, _ = handler.performRequests_error_([request], None)
+    if not success:
+        return False
+
+    bounds = info["kCGWindowBounds"]
+    win_x = float(bounds["X"])
+    win_y = float(bounds["Y"])
+    win_w = float(bounds["Width"])
+    win_h = float(bounds["Height"])
+    target = portfolio_code.strip().upper()
+    candidates: list[tuple[float, float, float]] = []
+
+    for observation in request.results() or []:
+        top_candidates = observation.topCandidates_(3)
+        if not top_candidates:
+            continue
+        for candidate in top_candidates:
+            text = candidate.string().upper()
+            codes = [match.upper() for match in PORTFOLIO_CODE_RE.findall(text)]
+            if target not in codes and text.strip() != target:
+                continue
+
+            box = observation.boundingBox()
+            cx = win_x + (box.origin.x + box.size.width / 2) * win_w
+            cy = win_y + (1 - box.origin.y - box.size.height / 2) * win_h
+            if (
+                list_rect.x <= cx <= list_rect.right
+                and list_rect.y <= cy <= list_rect.bottom
+            ):
+                candidates.append((candidate.confidence(), cx, cy))
+
+    if not candidates:
+        return False
+
+    _, x, y = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+    mouse_click_xy(x, y)
+    time.sleep(PORTFOLIO_SETTLE)
+    return True
+
+
+def select_portfolio(
+    app,
+    portfolio_code: Optional[str],
+    *,
+    discard_open_manager: bool = False,
+) -> None:
+    if not portfolio_code:
+        return
+
+    normalized = portfolio_code.strip().upper()
+    if not normalized:
+        return
+
+    if find_window(app, MANAGER_TITLE):
+        if discard_open_manager:
+            if not close_manager_without_saving(app):
+                raise RuntimeError(
+                    "A Portfolio Manager window is already open and could not be discarded."
+                )
+        else:
+            raise RuntimeError(
+                "A Portfolio Manager window is already open. Close it before using "
+                f"--portfolio {normalized}, or pass --discard-open-manager to close it "
+                "without saving first."
+            )
+
+    ensure_portfolio_page(app)
+    target = find_visible_portfolio_code(app, normalized)
+    if not target:
+        target = wait_for(lambda: find_visible_portfolio_code(app, normalized), timeout=2.0)
+    if not target and ocr_click_portfolio_code(app, normalized):
+        return
+    if not target:
+        seen_codes = visible_portfolio_codes(app)
+        seen_text = ", ".join(seen_codes) if seen_codes else "none"
+        raise RuntimeError(
+            f"Could not find visible portfolio code {normalized!r}. "
+            "Open the Portfolio page and make sure that portfolio is visible in the list. "
+            f"Visible portfolio codes seen by Accessibility: {seen_text}."
+        )
+
+    mouse_click(target)
+    time.sleep(PORTFOLIO_SETTLE)
 
 
 def open_manager(app):
@@ -349,14 +674,9 @@ def open_manager(app):
     if not button:
         # Navigate to the portfolio tab only when the manager button is not
         # already visible. This is the hot path after the first successful run.
-        for window in windows(app):
-            portfolio_button = find_descendant(
-                window,
-                lambda e: button_text_is(e, "组合") and ax_rect(e) and ax_rect(e).x < 140,
-            )
-            if portfolio_button:
-                press(portfolio_button)
-                break
+        portfolio_button = find_portfolio_nav_button(app)
+        if portfolio_button:
+            press(portfolio_button)
 
         button = wait_for(lambda: find_manager_button(app), timeout=2.5)
     if not button:
@@ -542,13 +862,15 @@ def find_position_field(window, symbol: str):
     if not fields:
         raise RuntimeError("Could not find the position percentage field after selecting the stock.")
 
-    if symbol_rows:
-        row_y = sorted(symbol_rows)[0]
-        same_row = [f for f in fields if abs(ax_rect(f).cy - row_y) < 18]
-        if same_row:
-            return sorted(same_row, key=lambda f: ax_rect(f).x)[0]
+    if not symbol_rows:
+        return None
 
-    return sorted(fields, key=lambda f: (ax_rect(f).y, ax_rect(f).x))[0]
+    row_y = sorted(symbol_rows)[0]
+    same_row = [f for f in fields if abs(ax_rect(f).cy - row_y) < 18]
+    if same_row:
+        return sorted(same_row, key=lambda f: ax_rect(f).x)[0]
+
+    return None
 
 
 def find_existing_position_field(window, symbol: str):
@@ -761,6 +1083,8 @@ def build_position(
     percent: str,
     dry_run: bool = False,
     record: bool = True,
+    portfolio_code: Optional[str] = None,
+    discard_open_manager: bool = False,
     started_at: Optional[float] = None,
 ) -> None:
     check_accessibility_permission()
@@ -768,6 +1092,7 @@ def build_position(
     app = AX.AXUIElementCreateApplication(pid)
     activate_app(app)
 
+    select_portfolio(app, portfolio_code, discard_open_manager=discard_open_manager)
     manager = open_manager(app)
     position_field = find_existing_position_field(manager, symbol)
     if not position_field:
@@ -784,7 +1109,7 @@ def build_position(
             )
         if checkbox and mouse_click_point(search_result_checkbox_point(manager)):
             time.sleep(ROW_SETTLE)
-            position_field = wait_for(lambda: find_first_position_field(manager), timeout=0.25)
+            position_field = wait_for(lambda: find_position_field(manager, symbol), timeout=0.6)
 
         if not position_field:
             checkbox = checkbox or wait_for(lambda: find_visible_checkbox(manager, symbol), timeout=2.0)
@@ -792,9 +1117,7 @@ def build_position(
                 raise RuntimeError(f"Could not find a visible search result for {symbol!r}.")
             mouse_click(checkbox)
             time.sleep(ROW_SETTLE)
-            position_field = wait_for(lambda: find_first_position_field(manager), timeout=0.6)
-            if not position_field:
-                position_field = wait_for(lambda: find_position_field(manager, symbol), timeout=1.0)
+            position_field = wait_for(lambda: find_position_field(manager, symbol), timeout=1.0)
     if not position_field:
         raise RuntimeError("Could not find the position percentage field after selecting the stock.")
     if record:
@@ -804,7 +1127,11 @@ def build_position(
     replace_text(position_field, percent)
 
     if dry_run:
-        print(f"Dry run complete: {symbol.upper()} is selected and position is set to {percent}%.")
+        portfolio_text = f" in portfolio {portfolio_code.strip().upper()}" if portfolio_code else ""
+        print(
+            f"Dry run complete: {symbol.upper()} is selected{portfolio_text} "
+            f"and position is set to {percent}%."
+        )
         return
 
     if not mouse_click_point(confirm_button_point(manager)):
@@ -824,13 +1151,16 @@ def build_position(
         )
         print(f"Record written: {path}")
     elapsed = f" Elapsed: {elapsed_seconds(started_at)}." if started_at is not None else ""
-    print(f"Done: {symbol.upper()} position set to {percent}%.{elapsed}")
+    portfolio_text = f" in portfolio {portfolio_code.strip().upper()}" if portfolio_code else ""
+    print(f"Done: {symbol.upper()} position set to {percent}%{portfolio_text}.{elapsed}")
 
 
 def close_position(
     symbol: str,
     dry_run: bool = False,
     record: bool = True,
+    portfolio_code: Optional[str] = None,
+    discard_open_manager: bool = False,
     started_at: Optional[float] = None,
 ) -> None:
     check_accessibility_permission()
@@ -838,6 +1168,7 @@ def close_position(
     app = AX.AXUIElementCreateApplication(pid)
     activate_app(app)
 
+    select_portfolio(app, portfolio_code, discard_open_manager=discard_open_manager)
     manager = open_manager(app)
 
     delete_button = wait_for(lambda: find_delete_button(manager, symbol), timeout=2.0)
@@ -849,8 +1180,9 @@ def close_position(
 
     if dry_run:
         rect = ax_rect(delete_button)
+        portfolio_text = f" in portfolio {portfolio_code.strip().upper()}" if portfolio_code else ""
         print(
-            f"Dry run complete: found delete button for {symbol.upper()} "
+            f"Dry run complete: found delete button for {symbol.upper()}{portfolio_text} "
             f"at ({rect.cx:.0f}, {rect.cy:.0f}); confirm was not clicked."
         )
         return
@@ -873,7 +1205,8 @@ def close_position(
         )
         print(f"Record written: {path}")
     elapsed = f" Elapsed: {elapsed_seconds(started_at)}." if started_at is not None else ""
-    print(f"Done: {symbol.upper()} was removed from the portfolio.{elapsed}")
+    portfolio_text = f" {portfolio_code.strip().upper()}" if portfolio_code else ""
+    print(f"Done: {symbol.upper()} was removed from the portfolio{portfolio_text}.{elapsed}")
 
 
 def is_close_target(value: str) -> bool:
@@ -910,10 +1243,30 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Stop before clicking the final confirm button.",
     )
+    parser.add_argument(
+        "--portfolio",
+        "--portfolio-code",
+        dest="portfolio_code",
+        metavar="CODE",
+        default=os.environ.get("FUTU_PORTFOLIO_CODE", ""),
+        help=(
+            "Portfolio code to select before opening Portfolio Manager, "
+            "e.g. PFL0137605. Can also be set with FUTU_PORTFOLIO_CODE."
+        ),
+    )
+    parser.add_argument(
+        "--discard-open-manager",
+        action="store_true",
+        help=(
+            "If Portfolio Manager is already open, click Cancel and choose "
+            "not to save before selecting --portfolio."
+        ),
+    )
     args = parser.parse_args(argv)
 
     symbol = args.symbol.strip()
     target = args.target.strip() if args.target else None
+    portfolio_code = args.portfolio_code.strip().upper()
     if not symbol:
         raise SystemExit("Symbol cannot be empty.")
 
@@ -923,6 +1276,8 @@ def main(argv: list[str]) -> int:
             symbol=symbol,
             dry_run=args.dry_run,
             record=should_record,
+            portfolio_code=portfolio_code,
+            discard_open_manager=args.discard_open_manager,
             started_at=started_at,
         )
         return 0
@@ -936,6 +1291,8 @@ def main(argv: list[str]) -> int:
         percent=percent,
         dry_run=args.dry_run,
         record=should_record,
+        portfolio_code=portfolio_code,
+        discard_open_manager=args.discard_open_manager,
         started_at=started_at,
     )
     return 0
