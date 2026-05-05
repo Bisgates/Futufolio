@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="record",
         action="store_true",
         default=False,
-        help="Append futu_utils/record.csv after a successful confirmed change.",
+        help="Append futufolio/record.csv after a successful confirmed change.",
     )
     parser.add_argument(
         "--no-record",

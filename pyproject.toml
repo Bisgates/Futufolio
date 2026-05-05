@@ -1,5 +1,5 @@
 [project]
-name = "futu-portfolio-rebalance"
+name = "futufolio"
 version = "0.1.0"
 description = "macOS Accessibility automation for FutuNiuniu portfolio rebalancing"
 readme = "README.md"
@@ -12,12 +12,11 @@ macos = [
 ]
 
 [project.scripts]
-futu-portfolio = "futu_utils.cli:run"
-futu-rebalance = "futu_utils.cli:run"
+futufolio = "futufolio.cli:run"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["futu_utils"]
+packages = ["futufolio"]

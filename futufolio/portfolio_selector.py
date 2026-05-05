@@ -14,7 +14,6 @@ from .ax_utils import (
     ax_rect,
     find_button_by_description,
     find_descendant,
-    mouse_click,
     mouse_click_xy,
     visible_in,
     wait_for,
@@ -33,13 +32,29 @@ def find_sheet(window):
 
 def click_manager_sheet_choice(manager, *, save: bool) -> bool:
     sheet = find_sheet(manager)
-    if not sheet:
-        return False
     description = "pub_button_default" if save else "pub_button_normal"
-    button = find_button_by_description(sheet, description, prefer_right=save)
-    if not button:
+
+    candidates = []
+    for item in walk(sheet or manager):
+        if ax_get(item, AX.kAXRoleAttribute) != AX.kAXButtonRole:
+            continue
+        if ax_get(item, AX.kAXDescriptionAttribute) != description:
+            continue
+        rect = ax_rect(item)
+        if rect and rect.w > 20 and rect.h > 10:
+            candidates.append((rect.y, rect.x, rect))
+    if sheet is None and candidates:
+        bottom_y = max(item[0] for item in candidates)
+        candidates = [item for item in candidates if item[0] < bottom_y - 40]
+    if not candidates:
         return False
-    mouse_click(button)
+
+    # When Futu exposes the sheet without AXSheetRole, the sheet buttons are
+    # higher than the manager's bottom Cancel/Confirm pair. Prefer that top row.
+    top_y = min(item[0] for item in candidates)
+    top_row = [item for item in candidates if abs(item[0] - top_y) < 8]
+    _, _, rect = sorted(top_row, key=lambda item: item[1], reverse=save)[0]
+    mouse_click_xy(rect.cx, rect.cy)
     return True
 
 
@@ -53,9 +68,10 @@ def close_manager_without_saving(app) -> bool:
         return bool(wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=1.5))
 
     cancel = find_button_by_description(manager, "pub_button_normal", prefer_right=False)
-    if not cancel:
+    rect = ax_rect(cancel) if cancel else None
+    if rect is None:
         return False
-    mouse_click(cancel)
+    mouse_click_xy(rect.cx, rect.cy)
 
     def closed_or_sheet():
         current = find_window(app, MANAGER_TITLE)
@@ -161,6 +177,14 @@ def find_visible_portfolio_code(app, portfolio_code: str):
     # Prefer the smallest matching visible element. In Futu's list this is
     # usually the code label itself, which is a safe click target for the row.
     return sorted(candidates, key=lambda candidate: candidate[:3])[0][3]
+
+
+def visible_portfolio_code_point(app, portfolio_code: str) -> Optional[tuple[float, float]]:
+    target = find_visible_portfolio_code(app, portfolio_code)
+    rect = ax_rect(target) if target else None
+    if rect is None:
+        return None
+    return rect.cx, rect.cy
 
 
 def futu_window_info():
@@ -282,12 +306,12 @@ def select_portfolio(
             )
 
     ensure_portfolio_page(app)
-    target = find_visible_portfolio_code(app, normalized)
-    if not target:
-        target = wait_for(lambda: find_visible_portfolio_code(app, normalized), timeout=2.0)
-    if not target and ocr_click_portfolio_code(app, normalized):
+    target_point = visible_portfolio_code_point(app, normalized)
+    if not target_point and ocr_click_portfolio_code(app, normalized):
         return
-    if not target:
+    if not target_point:
+        target_point = wait_for(lambda: visible_portfolio_code_point(app, normalized), timeout=0.4)
+    if not target_point:
         seen_codes = visible_portfolio_codes(app)
         seen_text = ", ".join(seen_codes) if seen_codes else "none"
         raise RuntimeError(
@@ -296,5 +320,5 @@ def select_portfolio(
             f"Visible portfolio codes seen by Accessibility: {seen_text}."
         )
 
-    mouse_click(target)
+    mouse_click_xy(*target_point)
     time.sleep(PORTFOLIO_SETTLE)

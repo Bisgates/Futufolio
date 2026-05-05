@@ -1,143 +1,77 @@
-# Futu Portfolio Rebalance
+# Futufolio
 
-A focused Python utility for automating **single-symbol** FutuNiuniu portfolio target-weight changes on macOS.
+通过模拟点击自动调仓富途牛牛的模拟组合（虚拟组合）。
 
-The project intentionally exposes a small public interface and keeps the fragile macOS Accessibility details behind it.
+程序利用 macOS Accessibility API 控制富途牛牛桌面端，模拟用户操作完成调仓，不涉及真实交易。
 
-## What This Tool Does
+## 前置条件
 
-- Opens FutuNiuniu's **Portfolio Manager** window.
-- Selects one stock symbol.
-- Sets its target position percentage.
-- Removes a holding when the target is `close`, `delete`, `remove`, `rm`, or `0`.
-- Optionally writes a local CSV record after a confirmed change.
+1. 下载老版富途牛牛 Mac 客户端（非 App Store 版本）
 
-It is **not** a Futu OpenAPI client and does **not** place brokerage orders directly.
+   ![老版富途客户端](assets/a.png)
 
-## Environment: uv
+2. 打开客户端后，进入模拟组合的调仓界面：
 
-This project uses `uv` for environment management.
+   ![调仓界面](assets/b.png)
 
-```bash
-uv sync
-```
+   **注意：程序运行前必须停留在此界面。**（后续版本会更灵活）
 
-For real macOS UI automation, install the PyObjC extra:
+3. 首次运行会跳出授予终端 macOS 辅助功能权限（系统设置 → 隐私与安全性 → 辅助功能）
+
+## 安装
 
 ```bash
 uv sync --extra macos
 ```
 
-Run checks:
+## 使用方法
+
+命令格式：
 
 ```bash
-uv run python -m unittest discover -s tests -v
+uv run futufolio <股票代码> [目标仓位百分比] --portfolio <组合编号>
 ```
 
-## CLI Usage
+组合编号以 `FPL` 开头，例如 `FPL0137605`。
 
-Recommended entrypoint:
+**目前只支持一次调仓一只股票。运行脚本期间不要动键盘和鼠标（程序需要控制输入设备，持续 3 秒以内）。**
+
+### 示例
 
 ```bash
-uv run futu-portfolio MSFT
-uv run futu-portfolio MSFT 100
-uv run futu-portfolio MSFT 50
-uv run futu-portfolio MSFT close
-uv run futu-portfolio MSFT 0
-uv run futu-portfolio MSFT --dry-run
-uv run futu-portfolio MSFT 100 --record
-uv run futu-portfolio MSFT 50 --portfolio PFL0137605
+# 将 MSFT 设为 100% 仓位
+uv run futufolio MSFT --portfolio FPL0137605
+
+# 将 MSFT 设为 50% 仓位
+uv run futufolio MSFT 50 --portfolio FPL0137605
+
+# 清仓 MSFT
+uv run futufolio MSFT close --portfolio FPL0137605
+uv run futufolio MSFT 0 --portfolio FPL0137605
+
+# 试运行（不会真正确认）
+uv run futufolio MSFT 50 --dry-run --portfolio FPL0137605
 ```
 
-Compatibility entrypoints still work:
+也可以通过环境变量设置默认组合编号，避免每次输入：
 
 ```bash
-python3 futu_portfolio.py MSFT 100
-python3 futu_utils/futu_portfolio.py MSFT 100
-python3 -m futu_utils MSFT 100
+export FUTU_PORTFOLIO_CODE=FPL0137605
+uv run futufolio MSFT 50
 ```
-
-You can also set a default portfolio code:
-
-```bash
-FUTU_PORTFOLIO_CODE=PFL0137605 uv run futu-portfolio MSFT 50
-```
-
-Use `--discard-open-manager` only when a previous dry run or manual edit left Portfolio Manager open and you want the script to close it without saving first.
 
 ## Python API
 
-External scripts should use the public API instead of importing UI selector modules.
-
 ```python
-from futu_utils import FutuPortfolioClient
+from futufolio import FutuPortfolioClient
 
 client = FutuPortfolioClient()
-client.set_position("MSFT", 50, portfolio_code="PFL0137605")
+client.set_position("MSFT", 50, portfolio_code="FPL0137605")
 client.close_position("MSFT")
 ```
 
-Command-object style is also supported:
+## 注意事项
 
-```python
-from futu_utils import FutuPortfolioClient, RebalanceAction, RebalanceCommand
-
-command = RebalanceCommand(
-    symbol="MSFT",
-    action=RebalanceAction.SET,
-    percent="50",
-    dry_run=True,
-)
-result = FutuPortfolioClient().rebalance(command)
-print(result.message)
-```
-
-## Recording
-
-Confirmed operations are **not recorded by default**.
-
-Use `--record` or `record=True` to append:
-
-```text
-futu_utils/record.csv
-```
-
-Column format:
-
-```csv
-日期,时间,股票名称,代码,变化前持仓,变化后持仓,成交价,说明
-```
-
-`--dry-run` never writes a record because it does not click final confirm.
-
-## Requirements
-
-- macOS.
-- `/Applications/FutuNiuniu.app` installed.
-- macOS Accessibility permission granted to the terminal app running Python.
-- PyObjC installed through `uv sync --extra macos` for real UI automation.
-
-## Project Structure
-
-```text
-futu_portfolio.py          # top-level convenience entrypoint
-futu_utils/
-  api.py                   # public Python interface
-  models.py                # command/result/geometry data models
-  cli.py                   # argparse and command rendering
-  rebalance.py             # high-level set/remove workflows
-  manager_ui.py            # Portfolio Manager selectors
-  portfolio_selector.py    # portfolio-code selection helpers
-  futu_app.py              # Futu app/window navigation
-  ax_utils.py              # Accessibility and input helpers
-  pyobjc_runtime.py        # lazy PyObjC loading and permission checks
-  recorder.py              # optional record.csv writer
-  futu_portfolio.py        # legacy package entrypoint
-```
-
-## Safety Notes
-
-- This is GUI automation; Futu UI layout changes can break selectors.
-- The script verifies that Portfolio Manager closes after confirm, but it does not verify backend portfolio state through an API.
-- Avoid moving/clicking the mouse while the script is running.
-- Use `--dry-run` before changing a new symbol or after FutuNiuniu updates.
+- 这是 GUI 自动化工具，富途客户端 UI 更新可能导致程序失效
+- 运行期间请勿移动鼠标或使用键盘
+- 建议先用 `--dry-run` 验证流程，再正式执行

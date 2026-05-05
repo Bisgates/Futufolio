@@ -64,8 +64,8 @@ def visible_in(element, container: Optional[Rect], margin: float = 4) -> bool:
     if rect is None:
         return False
     return (
-        container.x - margin <= rect.x <= container.right + margin
-        and container.y - margin <= rect.y <= container.bottom + margin
+        container.x - margin <= rect.cx <= container.right + margin
+        and container.y - margin <= rect.cy <= container.bottom + margin
         and rect.w > 0
         and rect.h > 0
     )
@@ -109,13 +109,6 @@ def mouse_click_xy(x: float, y: float) -> None:
         time.sleep(EVENT_PAUSE)
 
 
-def mouse_click(element) -> None:
-    rect = ax_rect(element)
-    if rect is None:
-        raise RuntimeError("Cannot click element without position/size")
-    mouse_click_xy(rect.cx, rect.cy)
-
-
 def mouse_click_point(point: Optional[tuple[float, float]]) -> bool:
     if point is None:
         return False
@@ -127,7 +120,10 @@ def press(element) -> None:
     err = AX.AXUIElementPerformAction(element, AX.kAXPressAction)
     # Some Futu controls return an AX timeout error even though the click succeeds.
     if err not in (0, -25205):
-        mouse_click(element)
+        rect = ax_rect(element)
+        if rect is None:
+            raise RuntimeError(f"Cannot press/click element without position/size: {ax_text(element) or '<empty>'}")
+        mouse_click_xy(rect.cx, rect.cy)
 
 
 def keypress(key_code: int, flags: int = 0) -> None:
@@ -156,7 +152,10 @@ def replace_text(field, text: str, settle: float = 0.0) -> None:
         return
 
     AX.AXUIElementSetAttributeValue(field, AX.kAXFocusedAttribute, True)
-    mouse_click(field)
+    rect = ax_rect(field)
+    if rect is None:
+        raise RuntimeError(f"Cannot focus text field without position/size: {ax_text(field) or '<empty>'}")
+    mouse_click_xy(rect.cx, rect.cy)
     time.sleep(FOCUS_SETTLE)
     set_clipboard(text)
     keypress(KEY_A, cmd_flag())

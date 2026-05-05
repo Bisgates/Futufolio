@@ -1,4 +1,4 @@
-"""Run ``python -m futu_utils``."""
+"""Run ``python -m futufolio``."""
 
 from .cli import run
 

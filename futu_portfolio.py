@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Top-level convenience entrypoint for Futu portfolio rebalancing."""
 
-from futu_utils.cli import run
+from futufolio.cli import run
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Futu portfolio rebalance automation package."""
+"""Futufolio – Futu virtual portfolio rebalancing automation."""
 
 from .api import FutuPortfolioClient, close_position, set_position
 from .models import RebalanceAction, RebalanceCommand, RebalanceResult

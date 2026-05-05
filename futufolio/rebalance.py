@@ -5,14 +5,16 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from .ax_utils import ax_get, ax_rect, mouse_click, mouse_click_point, replace_text, wait_for
+from .ax_utils import ax_get, ax_rect, mouse_click_point, replace_text, wait_for
 from .constants import MANAGER_TITLE, ROW_SETTLE, SEARCH_RESULT_SETTLE
 from .futu_app import activate_app, find_window, get_pid, open_manager
 from .manager_ui import (
     confirm_button_point,
     find_confirm_button,
     find_delete_button,
+    find_delete_button_across_pages,
     find_existing_position_field,
+    find_existing_position_field_across_pages,
     find_first_matching_search_checkbox,
     find_position_field,
     find_search_field,
@@ -65,7 +67,7 @@ def build_position(
     """Set one symbol to a target percent.
 
     Kept as a compatibility Python API; new code can use
-    :class:`futu_utils.api.FutuPortfolioClient` or :class:`RebalanceCommand`.
+    :class:`futufolio.api.FutuPortfolioClient` or :class:`RebalanceCommand`.
     """
 
     return _build_position(
@@ -123,6 +125,8 @@ def _build_position(command: RebalanceCommand) -> RebalanceResult:
 
     position_field = find_existing_position_field(manager, command.symbol)
     if not position_field:
+        position_field = find_existing_position_field_across_pages(manager, command.symbol)
+    if not position_field:
         search = find_search_field(manager)
         replace_text(search, command.symbol, settle=SEARCH_RESULT_SETTLE)
 
@@ -146,7 +150,10 @@ def _build_position(command: RebalanceCommand) -> RebalanceResult:
             )
             if not checkbox:
                 raise RuntimeError(f"Could not find a visible search result for {command.symbol!r}.")
-            mouse_click(checkbox)
+            checkbox_rect = ax_rect(checkbox)
+            if checkbox_rect is None:
+                raise RuntimeError(f"Found search result for {command.symbol!r}, but it has no screen bounds.")
+            mouse_click_point((checkbox_rect.cx, checkbox_rect.cy))
             time.sleep(ROW_SETTLE)
             position_field = wait_for(
                 lambda: find_position_field(manager, command.symbol), timeout=1.0
@@ -179,7 +186,10 @@ def _build_position(command: RebalanceCommand) -> RebalanceResult:
         confirm = find_confirm_button(manager)
         # Futu's custom confirm button can report AXPress success without firing.
         # A real mouse click on the button center is more reliable here.
-        mouse_click(confirm)
+        confirm_rect = ax_rect(confirm)
+        if confirm_rect is None:
+            raise RuntimeError("Found confirm button, but it has no screen bounds.")
+        mouse_click_point((confirm_rect.cx, confirm_rect.cy))
     closed = wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=2.0)
     if not closed:
         raise RuntimeError("Clicked confirm, but the manager window is still open.")
@@ -209,7 +219,16 @@ def _build_position(command: RebalanceCommand) -> RebalanceResult:
 def _close_position(command: RebalanceCommand) -> RebalanceResult:
     app, manager = _prepare_manager(command)
 
-    delete_button = wait_for(lambda: find_delete_button(manager, command.symbol), timeout=2.0)
+    delete_button = find_delete_button(manager, command.symbol) or find_delete_button_across_pages(
+        manager, command.symbol
+    )
+    if not delete_button:
+        delete_button = wait_for(
+            lambda: find_delete_button(manager, command.symbol)
+            or find_delete_button_across_pages(manager, command.symbol),
+            timeout=0.5,
+            interval=0.05,
+        )
     if not delete_button:
         raise RuntimeError(f"Could not find {command.symbol} in the current portfolio rows.")
 
@@ -232,12 +251,25 @@ def _close_position(command: RebalanceCommand) -> RebalanceResult:
             ),
         )
 
-    mouse_click(delete_button)
-    wait_for(lambda: not position_row_centers(manager, command.symbol), timeout=1.0)
+    delete_rect = ax_rect(delete_button)
+    if delete_rect is None:
+        raise RuntimeError(f"Found delete button for {command.symbol}, but it has no screen bounds.")
+    mouse_click_point((delete_rect.cx, delete_rect.cy))
+    deleted_from_visible_rows = wait_for(
+        lambda: not position_row_centers(manager, command.symbol), timeout=1.0
+    )
+    if not deleted_from_visible_rows:
+        raise RuntimeError(
+            f"Clicked delete for {command.symbol}, but the row is still visible. "
+            "Not clicking confirm because the delete action may not have landed."
+        )
 
     if not mouse_click_point(confirm_button_point(manager)):
         confirm = find_confirm_button(manager)
-        mouse_click(confirm)
+        confirm_rect = ax_rect(confirm)
+        if confirm_rect is None:
+            raise RuntimeError("Found confirm button, but it has no screen bounds.")
+        mouse_click_point((confirm_rect.cx, confirm_rect.cy))
     closed = wait_for(lambda: find_window(app, MANAGER_TITLE) is None, timeout=2.0)
     if not closed:
         raise RuntimeError("Clicked confirm, but the manager window is still open.")

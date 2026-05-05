@@ -1,7 +1,7 @@
 """Public interface for Futu portfolio automation.
 
 This module is intentionally small. External scripts should import from here or
-from ``futu_utils`` instead of depending on the lower-level UI selector modules.
+from ``futufolio`` instead of depending on the lower-level UI selector modules.
 """
 
 from __future__ import annotations

@@ -2,8 +2,8 @@ import contextlib
 import io
 import unittest
 
-from futu_utils.cli import main, parse_command
-from futu_utils.models import RebalanceAction, RebalanceResult
+from futufolio.cli import main, parse_command
+from futufolio.models import RebalanceAction, RebalanceResult
 
 
 class FakeClient:

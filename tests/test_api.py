@@ -1,6 +1,6 @@
 import unittest
 
-from futu_utils import FutuPortfolioClient, RebalanceAction, RebalanceResult
+from futufolio import FutuPortfolioClient, RebalanceAction, RebalanceResult
 
 
 class ApiTests(unittest.TestCase):

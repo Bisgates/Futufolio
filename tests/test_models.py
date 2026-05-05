@@ -1,6 +1,6 @@
 import unittest
 
-from futu_utils.models import Rect, RebalanceAction, RebalanceCommand, RebalanceResult
+from futufolio.models import Rect, RebalanceAction, RebalanceCommand, RebalanceResult
 
 
 class ModelTests(unittest.TestCase):

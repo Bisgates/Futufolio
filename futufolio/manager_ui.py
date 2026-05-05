@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+import time
+from typing import Callable, Iterable, Optional, TypeVar
 
 from .pyobjc_runtime import AX
 from .ax_utils import ax_children, ax_get, ax_rect, ax_text, visible_in, walk
 from .models import Rect
+
+
+T = TypeVar("T")
+SCROLL_SETTLE = 0.015
+SCROLL_SCAN_VALUES = (
+    0.0,
+    0.08,
+    0.16,
+    0.24,
+    0.32,
+    0.40,
+    0.48,
+    0.56,
+    0.64,
+    0.72,
+    0.80,
+    0.88,
+    0.96,
+    1.0,
+)
 
 
 def walk_right_side(window) -> Iterable:
@@ -85,6 +106,158 @@ def right_position_area(window):
     return None
 
 
+def safely_visible_in_right_position_area(element, window) -> bool:
+    area = right_position_area(window)
+    area_rect = ax_rect(area) if area else None
+    if area_rect is None:
+        return False
+    return visible_in(element, area_rect, margin=0)
+
+
+def raw_position_row_centers(window, symbol: str) -> list[float]:
+    area = right_position_area(window)
+    area_rect = ax_rect(area) if area else None
+    if area is None or area_rect is None:
+        return []
+
+    target = symbol.upper()
+    rows: list[float] = []
+    for item in walk(area):
+        if ax_get(item, AX.kAXRoleAttribute) != AX.kAXStaticTextRole:
+            continue
+        value = ax_get(item, AX.kAXValueAttribute)
+        rect = ax_rect(item)
+        if (
+            isinstance(value, str)
+            and value.upper() == target
+            and rect
+            and area_rect.x <= rect.x <= area_rect.x + 100
+        ):
+            rows.append(rect.cy)
+    return sorted(rows)
+
+
+def bring_position_symbol_into_view(window, symbol: str) -> bool:
+    area = right_position_area(window)
+    area_rect = ax_rect(area) if area else None
+    current_value = right_position_scroll_value(window)
+    if area_rect is None or current_value is None:
+        return False
+
+    rows = raw_position_row_centers(window, symbol)
+    if not rows:
+        return False
+
+    target_y = rows[0]
+    if area_rect.y <= target_y <= area_rect.bottom:
+        return True
+
+    direction = 1.0 if target_y > area_rect.bottom else -1.0
+    probe_value = max(0.0, min(1.0, current_value + direction * 0.08))
+    if probe_value == current_value:
+        return False
+
+    if not set_right_position_scroll_value(window, probe_value):
+        return False
+
+    probe_rows = raw_position_row_centers(window, symbol)
+    if not probe_rows:
+        set_right_position_scroll_value(window, current_value)
+        return False
+
+    probe_y = probe_rows[0]
+    y_per_scroll = (probe_y - target_y) / (probe_value - current_value)
+    if abs(y_per_scroll) < 1:
+        set_right_position_scroll_value(window, current_value)
+        return False
+
+    desired_y = area_rect.y + area_rect.h * 0.5
+    desired_value = current_value + (desired_y - target_y) / y_per_scroll
+    return set_right_position_scroll_value(window, desired_value)
+
+
+def right_position_scroll_bar(window):
+    area = right_position_area(window)
+    if area is None:
+        return None
+
+    scroll_bar = ax_get(area, AX.kAXVerticalScrollBarAttribute)
+    if scroll_bar is not None:
+        return scroll_bar
+
+    for child in ax_children(area):
+        if ax_get(child, AX.kAXRoleAttribute) != AX.kAXScrollBarRole:
+            continue
+        rect = ax_rect(child)
+        if rect and rect.h >= rect.w:
+            return child
+    return None
+
+
+def right_position_scroll_value(window) -> Optional[float]:
+    scroll_bar = right_position_scroll_bar(window)
+    if scroll_bar is None:
+        return None
+    value = ax_get(scroll_bar, AX.kAXValueAttribute)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def set_right_position_scroll_value(window, value: float) -> bool:
+    scroll_bar = right_position_scroll_bar(window)
+    if scroll_bar is None:
+        return False
+    bounded = max(0.0, min(1.0, value))
+    err = AX.AXUIElementSetAttributeValue(scroll_bar, AX.kAXValueAttribute, bounded)
+    if err != 0:
+        return False
+    time.sleep(SCROLL_SETTLE)
+    return True
+
+
+def find_across_position_pages(window, finder: Callable[[], T | None]) -> T | None:
+    """Run a visible-row finder, then scan the right position list by scroll page.
+
+    The fast path still checks the current visible rows first.  The scroll
+    fallback fixes portfolios where the target symbol exists but is currently
+    below/above the visible slice of the selected-position table.
+    """
+
+    found = finder()
+    if found:
+        return found
+
+    original_value = right_position_scroll_value(window)
+    if original_value is None:
+        return None
+
+    if not set_right_position_scroll_value(window, 0.0):
+        return None
+
+    found = finder()
+    if found:
+        return found
+
+    seen_values = {round(right_position_scroll_value(window) or 0.0, 4)}
+    for target_value in SCROLL_SCAN_VALUES[1:]:
+        if not set_right_position_scroll_value(window, target_value):
+            break
+        current_value = right_position_scroll_value(window)
+        if current_value is not None:
+            rounded = round(current_value, 4)
+            if rounded in seen_values and target_value >= 1.0:
+                break
+            seen_values.add(rounded)
+
+        found = finder()
+        if found:
+            return found
+
+    set_right_position_scroll_value(window, original_value)
+    return None
+
+
 def find_search_field(window):
     win_rect = ax_rect(window)
     if win_rect is None:
@@ -104,9 +277,8 @@ def find_search_field(window):
 
 
 def find_first_position_field(window):
-    win_rect = ax_rect(window)
     area = right_position_area(window)
-    if win_rect is None or area is None:
+    if area is None:
         return None
 
     fields = []
@@ -114,7 +286,7 @@ def find_first_position_field(window):
         if ax_get(item, AX.kAXRoleAttribute) != AX.kAXTextFieldRole:
             continue
         rect = ax_rect(item)
-        if rect and visible_in(item, win_rect):
+        if rect and safely_visible_in_right_position_area(item, window):
             fields.append(item)
     if not fields:
         return None
@@ -124,8 +296,7 @@ def find_first_position_field(window):
 def first_position_symbol(window) -> str:
     area = right_position_area(window)
     area_rect = ax_rect(area) if area else None
-    win_rect = ax_rect(window)
-    if area is None or area_rect is None or win_rect is None:
+    if area is None or area_rect is None:
         return ""
 
     symbols: list[tuple[float, float, str]] = []
@@ -138,7 +309,7 @@ def first_position_symbol(window) -> str:
             isinstance(value, str)
             and value
             and rect
-            and visible_in(item, win_rect)
+            and safely_visible_in_right_position_area(item, window)
             and area_rect.x <= rect.x <= area_rect.x + 100
             and area_rect.y <= rect.y <= area_rect.y + 55
         ):
@@ -203,7 +374,13 @@ def find_position_field(window, symbol: str):
             continue
         value = ax_get(item, AX.kAXValueAttribute)
         rect = ax_rect(item)
-        if isinstance(value, str) and value.upper() == target and rect and rect.x > win_rect.x + win_rect.w * 0.35:
+        if (
+            isinstance(value, str)
+            and value.upper() == target
+            and rect
+            and safely_visible_in_right_position_area(item, window)
+            and rect.x > win_rect.x + win_rect.w * 0.35
+        ):
             symbol_rows.append(rect.cy)
 
     fields = [
@@ -211,7 +388,7 @@ def find_position_field(window, symbol: str):
         for f in walk_right_side(window)
         if ax_get(f, AX.kAXRoleAttribute) == AX.kAXTextFieldRole
         and ax_rect(f)
-        and visible_in(f, win_rect)
+        and safely_visible_in_right_position_area(f, window)
         and ax_rect(f).x > win_rect.x + win_rect.w * 0.55
     ]
     if not fields:
@@ -247,7 +424,7 @@ def find_existing_position_field(window, symbol: str):
         for f in walk_right_side(window)
         if ax_get(f, AX.kAXRoleAttribute) == AX.kAXTextFieldRole
         and ax_rect(f)
-        and visible_in(f, win_rect)
+        and safely_visible_in_right_position_area(f, window)
         and ax_rect(f).x > win_rect.x + win_rect.w * 0.55
     ]
     row_y = rows[0]
@@ -255,6 +432,17 @@ def find_existing_position_field(window, symbol: str):
     if not same_row:
         return None
     return sorted(same_row, key=lambda f: ax_rect(f).x)[0]
+
+
+def find_existing_position_field_across_pages(window, symbol: str):
+    if bring_position_symbol_into_view(window, symbol):
+        found = find_existing_position_field(window, symbol)
+        if found:
+            return found
+    return find_across_position_pages(
+        window,
+        lambda: find_existing_position_field(window, symbol),
+    )
 
 
 def position_row_centers(window, symbol: str) -> list[float]:
@@ -274,7 +462,7 @@ def position_row_centers(window, symbol: str) -> list[float]:
             isinstance(value, str)
             and value.upper() == target
             and rect
-            and visible_in(item, win_rect)
+            and safely_visible_in_right_position_area(item, window)
             and rect.x > win_rect.x + win_rect.w * 0.35
         ):
             rows.append(rect.cy)
@@ -297,7 +485,11 @@ def find_delete_button(window, symbol: str):
         if ax_get(item, AX.kAXDescriptionAttribute) != "paint_tool_delete":
             continue
         rect = ax_rect(item)
-        if rect and visible_in(item, win_rect) and rect.x > win_rect.x + win_rect.w * 0.65:
+        if (
+            rect
+            and safely_visible_in_right_position_area(item, window)
+            and rect.x > win_rect.x + win_rect.w * 0.65
+        ):
             buttons.append(item)
 
     if not buttons:
@@ -308,6 +500,17 @@ def find_delete_button(window, symbol: str):
     if same_row:
         return sorted(same_row, key=lambda button: ax_rect(button).x, reverse=True)[0]
     return sorted(buttons, key=lambda button: abs(ax_rect(button).cy - row_y))[0]
+
+
+def find_delete_button_across_pages(window, symbol: str):
+    if bring_position_symbol_into_view(window, symbol):
+        found = find_delete_button(window, symbol)
+        if found:
+            return found
+    return find_across_position_pages(
+        window,
+        lambda: find_delete_button(window, symbol),
+    )
 
 
 def format_percent(value) -> str:
@@ -321,9 +524,8 @@ def format_percent(value) -> str:
 
 
 def position_row_details(window, symbol: str) -> dict[str, str]:
-    win_rect = ax_rect(window)
     rows = position_row_centers(window, symbol)
-    if win_rect is None or not rows:
+    if not rows:
         return {"name": "", "percent": ""}
 
     row_y = rows[0]
@@ -331,7 +533,11 @@ def position_row_details(window, symbol: str) -> dict[str, str]:
     row_fields = []
     for item in walk_right_side(window):
         rect = ax_rect(item)
-        if not rect or not visible_in(item, win_rect) or abs(rect.cy - row_y) >= 24:
+        if (
+            not rect
+            or not safely_visible_in_right_position_area(item, window)
+            or abs(rect.cy - row_y) >= 24
+        ):
             continue
         role = ax_get(item, AX.kAXRoleAttribute)
         value = ax_get(item, AX.kAXValueAttribute)
